@@ -1,0 +1,5 @@
+out
+*.Zone.Identifier
+*:Zone.Identifier
+.env
+chirpy
