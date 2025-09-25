@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -25,13 +26,15 @@ type apiConfig struct {
 	dbQueries      *db.Queries
 	platform       string
 	jwtSecret      string
+	polkaKey       string
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID          uuid.UUID `json:"id"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	Email       string    `json:"email"`
+	IsChirpyRed bool      `json:"is_chirpy_red"`
 }
 
 type Chirp struct {
@@ -191,8 +194,82 @@ func (cfg *apiConfig) createChirpHandler(w http.ResponseWriter, r *http.Request)
 	respondWithJSON(w, http.StatusCreated, chirp)
 }
 
+func (cfg *apiConfig) deleteChirpHandler(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	chirpIDParam := r.PathValue("chirpID")
+	chirpID, err := uuid.Parse(chirpIDParam)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID")
+		return
+	}
+
+	dbChirp, err := cfg.dbQueries.GetChirp(r.Context(), chirpID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			respondWithError(w, http.StatusNotFound, "Chirp not found")
+			return
+		}
+		log.Printf("error retrieving chirp %s: %v", chirpID, err)
+		respondWithError(w, http.StatusInternalServerError, "Could not delete chirp")
+		return
+	}
+
+	if dbChirp.UserID != userID {
+		respondWithError(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+
+	if err := cfg.dbQueries.DeleteChirp(r.Context(), chirpID); err != nil {
+		log.Printf("error deleting chirp %s: %v", chirpID, err)
+		respondWithError(w, http.StatusInternalServerError, "Could not delete chirp")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (cfg *apiConfig) listChirpsHandler(w http.ResponseWriter, r *http.Request) {
-	dbChirps, err := cfg.dbQueries.ListChirps(r.Context())
+	authorIDParam := r.URL.Query().Get("author_id")
+	sortParam := r.URL.Query().Get("sort")
+
+	sortOrder := "asc"
+	if sortParam != "" {
+		switch sortParam {
+		case "asc", "desc":
+			sortOrder = sortParam
+		default:
+			respondWithError(w, http.StatusBadRequest, "Invalid sort value")
+			return
+		}
+	}
+
+	var (
+		dbChirps []db.Chirp
+		err      error
+	)
+
+	if authorIDParam == "" {
+		dbChirps, err = cfg.dbQueries.ListChirps(r.Context())
+	} else {
+		authorID, parseErr := uuid.Parse(authorIDParam)
+		if parseErr != nil {
+			respondWithError(w, http.StatusBadRequest, "Invalid author_id")
+			return
+		}
+		dbChirps, err = cfg.dbQueries.ListChirpsByAuthor(r.Context(), authorID)
+	}
+
 	if err != nil {
 		log.Printf("error listing chirps: %v", err)
 		respondWithError(w, http.StatusInternalServerError, "Could not retrieve chirps")
@@ -209,6 +286,19 @@ func (cfg *apiConfig) listChirpsHandler(w http.ResponseWriter, r *http.Request) 
 			UserID:    dbChirp.UserID,
 		})
 	}
+
+	sort.SliceStable(chirps, func(i, j int) bool {
+		if sortOrder == "asc" {
+			if chirps[i].CreatedAt.Equal(chirps[j].CreatedAt) {
+				return chirps[i].ID.String() < chirps[j].ID.String()
+			}
+			return chirps[i].CreatedAt.Before(chirps[j].CreatedAt)
+		}
+		if chirps[i].CreatedAt.Equal(chirps[j].CreatedAt) {
+			return chirps[i].ID.String() > chirps[j].ID.String()
+		}
+		return chirps[i].CreatedAt.After(chirps[j].CreatedAt)
+	})
 
 	respondWithJSON(w, http.StatusOK, chirps)
 }
@@ -324,10 +414,11 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := User{
-		ID:        dbUser.ID,
-		CreatedAt: dbUser.CreatedAt,
-		UpdatedAt: dbUser.UpdatedAt,
-		Email:     dbUser.Email,
+		ID:          dbUser.ID,
+		CreatedAt:   dbUser.CreatedAt,
+		UpdatedAt:   dbUser.UpdatedAt,
+		Email:       dbUser.Email,
+		IsChirpyRed: dbUser.IsChirpyRed,
 	}
 
 	response := struct {
@@ -408,6 +499,50 @@ func (cfg *apiConfig) revokeHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (cfg *apiConfig) polkaWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	type webhookRequest struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID uuid.UUID `json:"user_id"`
+		} `json:"data"`
+	}
+
+	apiKey, err := auth.GetAPIKey(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	if apiKey != cfg.polkaKey {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var req webhookRequest
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if req.Event != "user.upgraded" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if _, err := cfg.dbQueries.UpgradeToChirpyRed(r.Context(), req.Data.UserID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			respondWithError(w, http.StatusNotFound, "User not found")
+			return
+		}
+		log.Printf("error upgrading user %s to chirpy red: %v", req.Data.UserID, err)
+		respondWithError(w, http.StatusInternalServerError, "Could not upgrade user")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) {
 	type requestBody struct {
 		Email    string `json:"email"`
@@ -454,13 +589,83 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	user := User{
-		ID:        dbUser.ID,
-		CreatedAt: dbUser.CreatedAt,
-		UpdatedAt: dbUser.UpdatedAt,
-		Email:     dbUser.Email,
+		ID:          dbUser.ID,
+		CreatedAt:   dbUser.CreatedAt,
+		UpdatedAt:   dbUser.UpdatedAt,
+		Email:       dbUser.Email,
+		IsChirpyRed: dbUser.IsChirpyRed,
 	}
 
 	respondWithJSON(w, http.StatusCreated, user)
+}
+
+func (cfg *apiConfig) updateUserHandler(w http.ResponseWriter, r *http.Request) {
+	type requestBody struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var params requestBody
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&params); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if params.Email == "" {
+		respondWithError(w, http.StatusBadRequest, "Email is required")
+		return
+	}
+
+	if params.Password == "" {
+		respondWithError(w, http.StatusBadRequest, "Password is required")
+		return
+	}
+
+	hashedPassword, err := auth.HashPassword(params.Password)
+	if err != nil {
+		log.Printf("error hashing password: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Could not update user")
+		return
+	}
+
+	dbUser, err := cfg.dbQueries.UpdateUser(r.Context(), db.UpdateUserParams{
+		ID:             userID,
+		Email:          params.Email,
+		HashedPassword: hashedPassword,
+	})
+	if err != nil {
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
+			respondWithError(w, http.StatusBadRequest, "Email already exists")
+			return
+		}
+		log.Printf("error updating user %s: %v", userID, err)
+		respondWithError(w, http.StatusInternalServerError, "Could not update user")
+		return
+	}
+
+	user := User{
+		ID:          dbUser.ID,
+		CreatedAt:   dbUser.CreatedAt,
+		UpdatedAt:   dbUser.UpdatedAt,
+		Email:       dbUser.Email,
+		IsChirpyRed: dbUser.IsChirpyRed,
+	}
+
+	respondWithJSON(w, http.StatusOK, user)
 }
 
 func readinessHandler(w http.ResponseWriter, r *http.Request) {
@@ -513,11 +718,17 @@ func main() {
 		log.Fatal("JWT_SECRET environment variable not set")
 	}
 
+	polkaKey := os.Getenv("POLKA_KEY")
+	if polkaKey == "" {
+		log.Fatal("POLKA_KEY environment variable not set")
+	}
+
 	mux := http.NewServeMux()
 	apiCfg := &apiConfig{
 		dbQueries: dbQueries,
 		platform:  platform,
 		jwtSecret: jwtSecret,
+		polkaKey:  polkaKey,
 	}
 
 	mux.HandleFunc("GET /api/healthz", readinessHandler)
@@ -529,12 +740,15 @@ func main() {
 	mux.HandleFunc("GET /admin/metrics", apiCfg.adminMetricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
 	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
+	mux.HandleFunc("PUT /api/users", apiCfg.updateUserHandler)
 	mux.HandleFunc("POST /api/login", apiCfg.loginHandler)
 	mux.HandleFunc("POST /api/refresh", apiCfg.refreshHandler)
 	mux.HandleFunc("POST /api/revoke", apiCfg.revokeHandler)
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.polkaWebhookHandler)
 	mux.HandleFunc("GET /api/chirps", apiCfg.listChirpsHandler)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpHandler)
 	mux.HandleFunc("POST /api/chirps", apiCfg.createChirpHandler)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.deleteChirpHandler)
 
 	server := &http.Server{
 		Addr:    ":8080",

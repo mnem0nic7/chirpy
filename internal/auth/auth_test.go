@@ -143,3 +143,47 @@ func TestGetBearerTokenErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestGetAPIKey(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Authorization", "ApiKey   secret-value")
+
+	key, err := GetAPIKey(headers)
+	if err != nil {
+		t.Fatalf("GetAPIKey() error = %v", err)
+	}
+
+	if key != "secret-value" {
+		t.Fatalf("GetAPIKey() = %q, want %q", key, "secret-value")
+	}
+}
+
+func TestGetAPIKeyErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers http.Header
+	}{
+		{
+			name:    "missing header",
+			headers: http.Header{},
+		},
+		{
+			name: "wrong prefix",
+			headers: http.Header{
+				"Authorization": []string{"Bearer abc"},
+			},
+		},
+		{
+			name: "empty key",
+			headers: http.Header{
+				"Authorization": []string{"ApiKey   "},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		if _, err := GetAPIKey(tc.headers); err == nil {
+			t.Fatalf("GetAPIKey() expected error for case %q", tc.name)
+		}
+	}
+}
